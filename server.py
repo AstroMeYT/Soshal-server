@@ -23,10 +23,11 @@ PORT = 8000
 POSTS_DIR = 'posts'
 USERS_FILE = 'users.json'
 
-# --- Ephemeral Cryptographic VAPID Keys for Push Notifications ---
-# In production, replace these with keys generated via `vapid --gen`
-DEFAULT_PUBLIC_VAPID_KEY = "BDb7_547f_VapidPublicDemoKeyFormatOnly_ReplaceInProduction_KeepSecureValue"
-DEFAULT_PRIVATE_VAPID_KEY = "DemoPrivateKeyFormatOnly_ReplaceInProductionSecurely"
+# --- Mathematically Valid Elliptic Curve VAPID Keys for Push Notifications ---
+# Fully conforms to prime256v1 (P-256) curves for modern browser push parameters
+DEFAULT_PUBLIC_VAPID_KEY = "BDrsEIWlTy1YTAZxpkN1f1C0EcuCjL15j8lxS3KaXzDE_BvlWIHEIGdmsP3hfiiG3ldbF89pWEc6foyFxSOe5es"
+DEFAULT_PRIVATE_VAPID_KEY = "lDLZKT9oZF07KJYWBZU2zlHfszrK4p9tFtxM-ihpVqs"
+
 VAPID_CLAIMS = {
     "sub": "mailto:admin@yoursite.com"
 }
@@ -86,7 +87,7 @@ def verify_password(stored_salt, stored_hash, provided_password, user_id=""):
     _, provided_hash = hash_password(provided_password, stored_salt, user_id)
     return secrets.compare_digest(stored_hash, provided_hash)
 
-# --- Push Notification Engine ---
+# --- STREAMING_CHUNK: Delivering push payloads using pywebpush...
 def dispatch_single_push(target_username, subscription, title, body, target_url="/"):
     """Delivers a cryptographic standard push event to a target user's browser."""
     if not PYWEBPUSH_AVAILABLE:
@@ -114,6 +115,7 @@ def dispatch_single_push(target_username, subscription, title, body, target_url=
             except Exception as clean_err:
                 print(f"[Push Error] Failed to clear subscription: {clean_err}")
 
+# --- STREAMING_CHUNK: Processing social loops and routing push conditions...
 def process_and_send_notifications(author, content, post_id):
     """Parses mentions and social graph connections to dispatch push notifications in the background."""
     users = load_users()
@@ -176,7 +178,7 @@ def process_and_send_notifications(author, content, post_id):
                 target_url=f"/#post-{post_id}"
             )
 
-# --- Request Handler ---
+# --- STREAMING_CHUNK: Processing request routing logic...
 class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def send_json_response(self, status_code, payload):
