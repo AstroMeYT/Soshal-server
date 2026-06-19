@@ -8,6 +8,14 @@ import time
 import uuid
 import string
 import re
+import threading
+
+# --- Optional Cryptographic Push Library ---
+try:
+    from pywebpush import webpush, WebPushException
+    PYWEBPUSH_AVAILABLE = True
+except ImportError:
+    PYWEBPUSH_AVAILABLE = False
 
 # --- Configuration ---
 HOST = '0.0.0.0'
@@ -15,12 +23,21 @@ PORT = 8000
 POSTS_DIR = 'posts'
 USERS_FILE = 'users.json'
 
+# --- Ephemeral Cryptographic VAPID Keys for Push Notifications ---
+# In production, replace these with keys generated via `vapid --gen`
+DEFAULT_PUBLIC_VAPID_KEY = "BDb7_547f_VapidPublicDemoKeyFormatOnly_ReplaceInProduction_KeepSecureValue"
+DEFAULT_PRIVATE_VAPID_KEY = "DemoPrivateKeyFormatOnly_ReplaceInProductionSecurely"
+VAPID_CLAIMS = {
+    "sub": "mailto:admin@yoursite.com"
+}
+
 # --- In-Memory Session Store ---
 ACTIVE_SESSIONS = {}
 SESSION_EXPIRY_SECONDS = 86400 # 24 hours
 
 # --- Validation Helpers ---
 UUID_REGEX = re.compile(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', re.IGNORECASE)
+MENTION_REGEX = re.compile(r'@([a-zA-Z0-9_]+)#([a-zA-Z0-9]{5})')
 
 def is_safe_post_id(post_id):
     """Strictly validates that the post_id matches a standard UUID v4 format."""
@@ -68,6 +85,96 @@ def verify_password(stored_salt, stored_hash, provided_password, user_id=""):
     """Verifies a provided password against the stored salt, hash, and user_id payload."""
     _, provided_hash = hash_password(provided_password, stored_salt, user_id)
     return secrets.compare_digest(stored_hash, provided_hash)
+
+# --- Push Notification Engine ---
+def dispatch_single_push(target_username, subscription, title, body, target_url="/"):
+    """Delivers a cryptographic standard push event to a target user's browser."""
+    if not PYWEBPUSH_AVAILABLE:
+        print(f"[Push Warning] Cannot notify {target_username}. Run 'pip install pywebpush' on the server.")
+        return
+
+    try:
+        webpush(
+            subscription_info=subscription,
+            data=json.dumps({"title": title, "body": body, "url": target_url}),
+            vapid_private_key=DEFAULT_PRIVATE_VAPID_KEY,
+            vapid_claims=VAPID_CLAIMS
+        )
+        print(f"[Push System] Notification sent to {target_username}")
+    except WebPushException as ex:
+        print(f"[Push Error] WebPush failed for {target_username}: {ex}")
+        # Automatically clean up expired or invalid subscriptions
+        if ex.response and ex.response.status_code in [404, 410]:
+            try:
+                users = load_users()
+                if target_username in users and 'push_subscription' in users[target_username]:
+                    del users[target_username]['push_subscription']
+                    save_users(users)
+                    print(f"[Push System] Cleared expired subscription for {target_username}")
+            except Exception as clean_err:
+                print(f"[Push Error] Failed to clear subscription: {clean_err}")
+
+def process_and_send_notifications(author, content, post_id):
+    """Parses mentions and social graph connections to dispatch push notifications in the background."""
+    users = load_users()
+    
+    # 1. Identify all explicit mentions (@Username#userid)
+    mentions = MENTION_REGEX.findall(content)
+    notified_users = set()
+
+    for m_username, m_userid in mentions:
+        # Match case-insensitively but resolve against real keys
+        resolved_name = None
+        for registered_name in users:
+            if registered_name.lower() == m_username.lower():
+                # Verify unique user id suffix matches
+                if users[registered_name].get('user_id') == m_userid:
+                    resolved_name = registered_name
+                    break
+        
+        if resolved_name and resolved_name != author:
+            user_data = users[resolved_name]
+            pref = user_data.get('notification_preference', 'following')
+            sub = user_data.get('push_subscription')
+            
+            if pref != 'off' and sub:
+                notified_users.add(resolved_name)
+                dispatch_single_push(
+                    target_username=resolved_name,
+                    subscription=sub,
+                    title="You were mentioned!",
+                    body=f"@{author} tagged you: \"{content[:60]}\"",
+                    target_url=f"/#post-{post_id}"
+                )
+
+    # 2. Identify remaining followers/users based on their personal configurations
+    for username, data in users.items():
+        if username == author or username in notified_users:
+            continue
+            
+        pref = data.get('notification_preference', 'following') # Defaults to 'following'
+        sub = data.get('push_subscription')
+        
+        if pref == 'off' or not sub:
+            continue
+            
+        should_notify = False
+        if pref == 'everyone':
+            should_notify = True
+        elif pref == 'following':
+            # Check if this user is following the author of the post
+            followers_list = users.get(author, {}).get('followers', [])
+            if username in followers_list:
+                should_notify = True
+                
+        if should_notify:
+            dispatch_single_push(
+                target_username=username,
+                subscription=sub,
+                title=f"New post from {author}",
+                body=content[:80] if content else "Shared an image.",
+                target_url=f"/#post-{post_id}"
+            )
 
 # --- Request Handler ---
 class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -137,7 +244,6 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
             alphabet = string.ascii_letters + string.digits
             user_id = "".join(secrets.choice(alphabet) for _ in range(5))
 
-            # Apply the user_id to the hashed key payload
             salt, hashed_pwd = hash_password(password, user_id=user_id)
             
             users[username] = {
@@ -146,7 +252,8 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
                 "password_hash": hashed_pwd,
                 "created_at": time.time(),
                 "followers": [],
-                "following": []
+                "following": [],
+                "notification_preference": "following" # Default setting
             }
             save_users(users)
             return self.send_json_response(201, {"message": "User created successfully"})
@@ -210,8 +317,37 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
                 "followers_count": len(followers),
                 "following_count": len(following),
                 "is_following": username in followers,
-                "is_self": target_user == username 
+                "is_self": target_user == username,
+                "notification_preference": target.get('notification_preference', 'following')
             })
+
+        # --- SAVE NOTIFICATION PREFERENCES & SUBSCRIPTION ---
+        elif self.path == '/api/users/save_notifications_settings':
+            username = self.get_authenticated_user()
+            if not username:
+                return self.send_json_response(401, {"error": "Unauthorized."})
+
+            preference = data.get('preference', 'following')
+            subscription = data.get('subscription')
+
+            if preference not in ['off', 'following', 'everyone']:
+                return self.send_json_response(400, {"error": "Invalid preference option"})
+
+            users = load_users()
+            if username in users:
+                users[username]['notification_preference'] = preference
+                if subscription:
+                    users[username]['push_subscription'] = subscription
+                elif preference == 'off' and 'push_subscription' in users[username]:
+                    # Optionally clear subscription if turned off completely
+                    del users[username]['push_subscription']
+                
+                save_users(users)
+                return self.send_json_response(200, {
+                    "message": "Notification preferences updated successfully",
+                    "preference": preference
+                })
+            return self.send_json_response(404, {"error": "User profile not found"})
 
         # --- FOLLOW/UNFOLLOW ---
         elif self.path == '/api/users/follow':
@@ -253,7 +389,7 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
             save_users(users)
             return self.send_json_response(200, {"message": f"Successfully {action}ed {target_user}"})
 
-        # --- 4. CREATE POST ---
+        # --- CREATE POST ---
         elif self.path == '/api/posts/create':
             username = self.get_authenticated_user()
             if not username:
@@ -279,9 +415,16 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
             with open(file_path, 'w') as f:
                 json.dump(post_data, f, indent=4)
 
+            # Fire off Web Push dispatches in a non-blocking background thread
+            threading.Thread(
+                target=process_and_send_notifications,
+                args=(username, content or "", post_id),
+                daemon=True
+            ).start()
+
             return self.send_json_response(201, {"message": "Post created", "post": post_data})
 
-        # --- 5. LIST POSTS (Global & Friends) ---
+        # --- LIST POSTS ---
         elif self.path == '/api/posts/list':
             username = self.get_authenticated_user()
             if not username:
@@ -303,7 +446,6 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
             else:
                 for filename in os.listdir(POSTS_DIR):
                     if filename.endswith('.json'):
-                        # Defensive check: Ensure we only parse files matching valid UUID names
                         name_without_ext = os.path.splitext(filename)[0]
                         if not is_safe_post_id(name_without_ext):
                             continue
@@ -322,7 +464,7 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
                 "is_following_empty": is_following_empty
             })
 
-        # --- 6. USER SPECIFIC POSTS (Profile Page) ---
+        # --- USER SPECIFIC POSTS ---
         elif self.path == '/api/posts/user':
             username = self.get_authenticated_user()
             if not username:
@@ -348,7 +490,7 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
             all_posts.sort(key=lambda x: x['timestamp'], reverse=True)
             return self.send_json_response(200, {"posts": all_posts[:limit]})
 
-        # --- 7. LIKE POST ---
+        # --- LIKE POST ---
         elif self.path == '/api/posts/like':
             username = self.get_authenticated_user()
             if not username:
@@ -357,11 +499,9 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
             post_id = data.get('post_id')
             action = data.get('action', 'like')
             
-            # Defensive validation: Ensure post_id exists and conforms to a clean UUID
             if not post_id or not is_safe_post_id(post_id):
                 return self.send_json_response(400, {"error": "Invalid post ID format"})
 
-            # Enforce clean filename sanitization using basename
             sanitized_id = os.path.basename(post_id)
             file_path = os.path.join(POSTS_DIR, f"{sanitized_id}.json")
             
@@ -381,7 +521,7 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
 
             return self.send_json_response(200, {"message": "Like updated", "likes": post_data['likes']})
 
-        # --- 8. SEARCH ---
+        # --- SEARCH ---
         elif self.path == '/api/search':
             username = self.get_authenticated_user()
             if not username:
@@ -427,6 +567,9 @@ class ReusableTCPServer(socketserver.TCPServer):
     allow_reuse_address = True
 
 if __name__ == '__main__':
+    if not PYWEBPUSH_AVAILABLE:
+        print("[!] Warning: pywebpush library is not installed.")
+        print("[!] Run: 'pip install pywebpush' to enable background cryptographic pushes.")
     with ReusableTCPServer((HOST, PORT), SoshalRequestHandler) as httpd:
         print(f"[*] Soshal API Server running at http://{HOST}:{PORT}")
         print("[*] Waiting for requests...")
