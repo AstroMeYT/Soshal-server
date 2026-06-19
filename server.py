@@ -62,9 +62,20 @@ def init_db():
                 password_hash TEXT,
                 created_at REAL,
                 notification_preference TEXT DEFAULT 'following',
-                push_subscription TEXT
+                push_subscription TEXT,
+                public_key TEXT,
+                encrypted_private_key TEXT,
+                private_key_iv TEXT
             )
         ''')
+        
+        # Migration logic to add E2EE direct messaging columns if they do not exist
+        cursor.execute("PRAGMA table_info(users)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if 'public_key' not in columns:
+            cursor.execute("ALTER TABLE users ADD COLUMN public_key TEXT")
+            cursor.execute("ALTER TABLE users ADD COLUMN encrypted_private_key TEXT")
+            cursor.execute("ALTER TABLE users ADD COLUMN private_key_iv TEXT")
         
         # 2. Create follows table
         cursor.execute('''
@@ -102,6 +113,21 @@ def init_db():
                 FOREIGN KEY (author) REFERENCES users(username) ON DELETE CASCADE
             )
         ''')
+
+        # 5. Create direct messages (DMs) table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS dms (
+                id TEXT PRIMARY KEY,
+                sender TEXT,
+                receiver TEXT,
+                encrypted_content TEXT,
+                iv TEXT,
+                timestamp REAL,
+                is_read INTEGER DEFAULT 0,
+                FOREIGN KEY (sender) REFERENCES users(username) ON DELETE CASCADE,
+                FOREIGN KEY (receiver) REFERENCES users(username) ON DELETE CASCADE
+            )
+        ''')
         
         # Indexes for speed optimization
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_posts_timestamp ON posts(timestamp DESC)')
@@ -109,15 +135,16 @@ def init_db():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_follows_follower ON follows(follower)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_follows_following ON follows(following)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_comments_post_id ON comments(post_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_dms_sender_receiver ON dms(sender, receiver)')
         conn.commit()
 
-    # --- Run One-Time Legacy Migration ---
+    # Run One-Time Legacy Migration
     migrate_legacy_data()
 
 def migrate_legacy_data():
     if not os.path.exists(LEGACY_USERS_FILE):
         return
-    print("[*] Legacy users.json database found. Initializing safe migration...")
+    print("[*] Legacy database migration initiated...")
     try:
         with open(LEGACY_USERS_FILE, 'r') as f:
             legacy_users = json.load(f)
@@ -141,7 +168,6 @@ def migrate_legacy_data():
                 for target in following_list:
                     cursor.execute('INSERT OR IGNORE INTO follows (follower, following) VALUES (?, ?)', (username, target))
             conn.commit()
-            print("[*] User accounts and social graph migrated successfully.")
 
             posts_migrated = 0
             if os.path.exists(LEGACY_POSTS_DIR):
@@ -159,14 +185,12 @@ def migrate_legacy_data():
                             VALUES (?, ?, ?, ?, ?, ?)
                         ''', (post.get('id'), post.get('author'), post.get('content', ''), post.get('image'), post.get('timestamp', time.time()), post.get('likes', 0)))
                         posts_migrated += 1
-                    except Exception as post_err:
-                        pass
+                    except: pass
                 conn.commit()
-                if posts_migrated > 0: print(f"[*] Migrated {posts_migrated} posts successfully.")
 
         os.rename(LEGACY_USERS_FILE, f"{LEGACY_USERS_FILE}.bak")
         if os.path.exists(LEGACY_POSTS_DIR): os.rename(LEGACY_POSTS_DIR, f"{LEGACY_POSTS_DIR}_bak")
-        print("[*] Legacy migration complete. JSON files archived safely as .bak")
+        print("[*] Legacy migration complete.")
     except Exception as migration_error:
         print(f"[!] Migration failed: {migration_error}")
 
@@ -191,7 +215,6 @@ def dispatch_single_push(target_username, subscription, title, body, target_url=
             vapid_private_key=DEFAULT_PRIVATE_VAPID_KEY,
             vapid_claims=VAPID_CLAIMS
         )
-        print(f"[Push System] Notification sent to {target_username}")
     except WebPushException as ex:
         if ex.response and ex.response.status_code in [404, 410]:
             try:
@@ -291,6 +314,10 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
 
         if self.path == '/api/signup':
             username, password = data.get('username'), data.get('password')
+            public_key = data.get('public_key')
+            encrypted_private_key = data.get('encrypted_private_key')
+            private_key_iv = data.get('private_key_iv')
+
             if not username or not password: return self.send_json_response(400, {"error": "Username and password required"})
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
@@ -299,7 +326,10 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
                 alphabet = string.ascii_letters + string.digits
                 user_id = "".join(secrets.choice(alphabet) for _ in range(5))
                 salt, hashed_pwd = hash_password(password, user_id=user_id)
-                cursor.execute('INSERT INTO users (username, user_id, salt, password_hash, created_at, notification_preference) VALUES (?, ?, ?, ?, ?, ?)', (username, user_id, salt, hashed_pwd, time.time(), 'following'))
+                cursor.execute('''
+                    INSERT INTO users (username, user_id, salt, password_hash, created_at, notification_preference, public_key, encrypted_private_key, private_key_iv) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (username, user_id, salt, hashed_pwd, time.time(), 'following', public_key, encrypted_private_key, private_key_iv))
                 conn.commit()
             return self.send_json_response(201, {"message": "User created successfully"})
 
@@ -307,13 +337,19 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
             username, password = data.get('username'), data.get('password')
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
-                cursor.execute('SELECT salt, password_hash, user_id FROM users WHERE username = ?', (username,))
+                cursor.execute('SELECT salt, password_hash, user_id, public_key, encrypted_private_key, private_key_iv FROM users WHERE username = ?', (username,))
                 row = cursor.fetchone()
             if not row or not verify_password(row[0], row[1], password, row[2]):
                 return self.send_json_response(401, {"error": "Invalid username or password"})
             token = secrets.token_urlsafe(32)
             ACTIVE_SESSIONS[token] = {"username": username, "expires": time.time() + SESSION_EXPIRY_SECONDS}
-            return self.send_json_response(200, {"message": "Login successful", "token": token})
+            return self.send_json_response(200, {
+                "message": "Login successful", 
+                "token": token,
+                "public_key": row[3],
+                "encrypted_private_key": row[4],
+                "private_key_iv": row[5]
+            })
 
         elif self.path == '/api/logout':
             auth_header = self.headers.get('Authorization')
@@ -321,6 +357,32 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
                 token = auth_header.split(' ')[1]
                 if token in ACTIVE_SESSIONS: del ACTIVE_SESSIONS[token]
             return self.send_json_response(200, {"message": "Logged out successfully"})
+
+        # End-to-End Cryptographic Key Upgrades (for existing legacy users)
+        elif self.path == '/api/users/upgrade_keys':
+            username = self.get_authenticated_user()
+            if not username: return self.send_json_response(401, {"error": "Unauthorized."})
+            public_key = data.get('public_key')
+            encrypted_private_key = data.get('encrypted_private_key')
+            private_key_iv = data.get('private_key_iv')
+
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute('UPDATE users SET public_key = ?, encrypted_private_key = ?, private_key_iv = ? WHERE username = ?', (public_key, encrypted_private_key, private_key_iv, username))
+                conn.commit()
+            return self.send_json_response(200, {"message": "Cryptographic keys registered successfully"})
+
+        elif self.path == '/api/users/get_public_key':
+            username = self.get_authenticated_user()
+            if not username: return self.send_json_response(401, {"error": "Unauthorized."})
+            target_user = data.get('username')
+
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT public_key FROM users WHERE username = ?', (target_user,))
+                row = cursor.fetchone()
+                if not row: return self.send_json_response(404, {"error": "User public key not found."})
+            return self.send_json_response(200, {"public_key": row[0]})
 
         elif self.path == '/api/users/profile':
             username = self.get_authenticated_user()
@@ -380,26 +442,6 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
             threading.Thread(target=process_and_send_notifications, args=(username, content or "", post_id), daemon=True).start()
             return self.send_json_response(201, {"message": "Post created", "post": {"id": post_id, "author": username, "content": content or "", "image": image_data, "timestamp": timestamp, "likes": 0, "comment_count": 0}})
 
-        # --- DELETE POST ---
-        elif self.path == '/api/posts/delete':
-            username = self.get_authenticated_user()
-            if not username: return self.send_json_response(401, {"error": "Unauthorized."})
-            post_id = data.get('post_id')
-            if not post_id or not is_safe_post_id(post_id):
-                return self.send_json_response(400, {"error": "Invalid format"})
-            with sqlite3.connect(DB_FILE) as conn:
-                cursor = conn.cursor()
-                cursor.execute('SELECT author FROM posts WHERE id = ?', (post_id,))
-                row = cursor.fetchone()
-                if not row:
-                    return self.send_json_response(404, {"error": "Post not found"})
-                if row[0] != username:
-                    return self.send_json_response(403, {"error": "Forbidden: You are not the author of this post"})
-                cursor.execute('DELETE FROM comments WHERE post_id = ?', (post_id,))
-                cursor.execute('DELETE FROM posts WHERE id = ?', (post_id,))
-                conn.commit()
-            return self.send_json_response(200, {"message": "Post deleted successfully", "post_id": post_id})
-
         # --- COMMENTS API ---
         elif self.path == '/api/posts/comment':
             username = self.get_authenticated_user()
@@ -415,7 +457,6 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
                 post_owner = cursor.fetchone()
                 conn.commit()
             
-            # Dispatch push notifications to author and mentions inside the comment
             if post_owner:
                 threading.Thread(target=process_and_send_notifications, args=(username, content, post_id, True, post_owner[0]), daemon=True).start()
 
@@ -429,6 +470,109 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
                 rows = cursor.fetchall()
             comments = [{"id": r[0], "author": r[1], "content": r[2], "timestamp": r[3]} for r in rows]
             return self.send_json_response(200, {"comments": comments})
+
+        # --- E2EE DIRECT MESSAGING (DMs) API ---
+        elif self.path == '/api/dms/send':
+            username = self.get_authenticated_user()
+            if not username: return self.send_json_response(401, {"error": "Unauthorized."})
+            receiver = data.get('receiver')
+            encrypted_content = data.get('encrypted_content')
+            iv = data.get('iv')
+
+            if not receiver or not encrypted_content or not iv:
+                return self.send_json_response(400, {"error": "Missing DM body details."})
+
+            dm_id, timestamp = str(uuid.uuid4()), time.time()
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute('INSERT INTO dms (id, sender, receiver, encrypted_content, iv, timestamp, is_read) VALUES (?, ?, ?, ?, ?, ?, 0)',
+                               (dm_id, username, receiver, encrypted_content, iv, timestamp))
+                
+                # Fetch receiver push notification details
+                cursor.execute('SELECT push_subscription, notification_preference FROM users WHERE username = ?', (receiver,))
+                row = cursor.fetchone()
+                conn.commit()
+
+            # Async dispatch of zero-knowledge push message
+            if row and row[0] and row[1] != 'off':
+                try:
+                    subscription = json.loads(row[0])
+                    push_title = "New Encrypted DM"
+                    push_body = f"You received a secure direct message from @{username}"
+                    threading.Thread(target=dispatch_single_push, args=(receiver, subscription, push_title, push_body, "/#dms"), daemon=True).start()
+                except: pass
+
+            return self.send_json_response(201, {"message": "Secure message transmitted."})
+
+        elif self.path == '/api/dms/list':
+            username = self.get_authenticated_user()
+            if not username: return self.send_json_response(401, {"error": "Unauthorized."})
+            target_user = data.get('target_user')
+
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT id, sender, receiver, encrypted_content, iv, timestamp 
+                    FROM dms 
+                    WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?)
+                    ORDER BY timestamp ASC
+                ''', (username, target_user, target_user, username))
+                rows = cursor.fetchall()
+                
+                # Mark incoming DMs as read
+                cursor.execute('UPDATE dms SET is_read = 1 WHERE sender = ? AND receiver = ?', (target_user, username))
+                conn.commit()
+
+            messages = [{"id": r[0], "sender": r[1], "receiver": r[2], "encrypted_content": r[3], "iv": r[4], "timestamp": r[5]} for r in rows]
+            return self.send_json_response(200, {"messages": messages})
+
+        elif self.path == '/api/dms/conversations':
+            username = self.get_authenticated_user()
+            if not username: return self.send_json_response(401, {"error": "Unauthorized."})
+
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                # Find all distinct messaging partners
+                cursor.execute('''
+                    SELECT DISTINCT CASE WHEN sender = ? THEN receiver ELSE sender END AS other_user 
+                    FROM dms WHERE sender = ? OR receiver = ?
+                ''', (username, username, username))
+                partners = [r[0] for r in cursor.fetchall()]
+
+                conversations = []
+                for p in partners:
+                    # Fetch latest message details for local client decryption/previews
+                    cursor.execute('''
+                        SELECT sender, receiver, encrypted_content, iv, timestamp 
+                        FROM dms 
+                        WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?)
+                        ORDER BY timestamp DESC LIMIT 1
+                    ''', (username, p, p, username))
+                    m_row = cursor.fetchone()
+                    
+                    # Tally unread incoming messages count
+                    cursor.execute('SELECT COUNT(*) FROM dms WHERE sender = ? AND receiver = ? AND is_read = 0', (p, username))
+                    unread_count = cursor.fetchone()[0]
+
+                    latest_msg = None
+                    if m_row:
+                        latest_msg = {
+                            "sender": m_row[0],
+                            "receiver": m_row[1],
+                            "encrypted_content": m_row[2],
+                            "iv": m_row[3],
+                            "timestamp": m_row[4]
+                        }
+
+                    conversations.append({
+                        "other_user": p,
+                        "unread_count": unread_count,
+                        "latest_message": latest_msg
+                    })
+
+            # Sort conversation threads chronologically based on latest message
+            conversations.sort(key=lambda x: x["latest_message"]["timestamp"] if x["latest_message"] else 0, reverse=True)
+            return self.send_json_response(200, {"conversations": conversations})
 
         # --- LIST POSTS ---
         elif self.path == '/api/posts/list':
@@ -479,7 +623,7 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
                 if action == 'like': cursor.execute('UPDATE posts SET likes = likes + 1 WHERE id = ?', (post_id,))
-                elif action == 'unlike': cursor.execute('UPDATE posts SET likes = MAX(0, likes - 1) WHERE id = ?', (post_id,))
+                elif action == 'unlike': cursor.execute('UPDATE posts SET likes = CASE WHEN likes > 0 THEN likes - 1 ELSE 0 END WHERE id = ?', (post_id,))
                 conn.commit()
                 cursor.execute('SELECT likes FROM posts WHERE id = ?', (post_id,))
                 row = cursor.fetchone()
