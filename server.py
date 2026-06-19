@@ -29,30 +29,27 @@ LEGACY_USERS_FILE = 'users.json'
 LEGACY_POSTS_DIR = 'posts'
 
 # --- Cryptographic VAPID Keys for Push Notifications ---
-# Mathematically valid Elliptic Curve P-256 Keys matching the client VAPID configuration
 DEFAULT_PUBLIC_VAPID_KEY = "BDrsEIWlTy1YTAZxpkN1f1C0EcuCjL15j8lxS3KaXzDE_BvlWIHEIGdmsP3hfiiG3ldbF89pWEc6foyFxSOe5es"
-DEFAULT_PRIVATE_VAPID_KEY = "g00-pXj3H71-Sg_fV76D92H7K0L23-Jp81O29P8371k" # Private point matching the above public key
+DEFAULT_PRIVATE_VAPID_KEY = "g00-pXj3H71-Sg_fV76D92H7K0L23-Jp81O29P8371k"
 VAPID_CLAIMS = {
     "sub": "mailto:admin@yoursite.com"
 }
 
-# --- In-Memory Session Store (Fast RAM Lookup) ---
+# --- In-Memory Session Store ---
 ACTIVE_SESSIONS = {}
-SESSION_EXPIRY_SECONDS = 86400  # 24 hours
+SESSION_EXPIRY_SECONDS = 86400
 
 # --- Validation Helpers ---
 UUID_REGEX = re.compile(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', re.IGNORECASE)
 MENTION_REGEX = re.compile(r'@([a-zA-Z0-9_]+)#([a-zA-Z0-9]{5})')
 
 def is_safe_post_id(post_id):
-    """Strictly validates that the post_id matches a standard UUID v4 format."""
     if not post_id or not isinstance(post_id, str):
         return False
     return bool(UUID_REGEX.match(post_id))
 
 # --- Database & Schema Initialization ---
 def init_db():
-    """Initializes the database schema and performs legacy JSON database migration if present."""
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         
@@ -92,22 +89,34 @@ def init_db():
                 FOREIGN KEY (author) REFERENCES users(username) ON DELETE CASCADE
             )
         ''')
+
+        # 4. Create comments table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS comments (
+                id TEXT PRIMARY KEY,
+                post_id TEXT,
+                author TEXT,
+                content TEXT,
+                timestamp REAL,
+                FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE,
+                FOREIGN KEY (author) REFERENCES users(username) ON DELETE CASCADE
+            )
+        ''')
         
-        # Create indexing paths for speed optimization
+        # Indexes for speed optimization
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_posts_timestamp ON posts(timestamp DESC)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_posts_author ON posts(author)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_follows_follower ON follows(follower)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_follows_following ON follows(following)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_comments_post_id ON comments(post_id)')
         conn.commit()
 
     # --- Run One-Time Legacy Migration ---
     migrate_legacy_data()
 
 def migrate_legacy_data():
-    """Reads legacy flat JSON files and migrates them safely into SQLite tables."""
     if not os.path.exists(LEGACY_USERS_FILE):
         return
-
     print("[*] Legacy users.json database found. Initializing safe migration...")
     try:
         with open(LEGACY_USERS_FILE, 'r') as f:
@@ -115,112 +124,66 @@ def migrate_legacy_data():
 
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            
-            # Migrate Users
             for username, udata in legacy_users.items():
-                # Check if user already exists in db to avoid duplicate conflicts
                 cursor.execute('SELECT 1 FROM users WHERE username = ?', (username,))
-                if cursor.fetchone():
-                    continue
-
-                # Insert user profile
+                if cursor.fetchone(): continue
                 cursor.execute('''
                     INSERT INTO users (username, user_id, salt, password_hash, created_at, notification_preference, push_subscription)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    username,
-                    udata.get('user_id'),
-                    udata.get('salt'),
-                    udata.get('password_hash'),
-                    udata.get('created_at', time.time()),
-                    udata.get('notification_preference', 'following'),
+                    username, udata.get('user_id'), udata.get('salt'), udata.get('password_hash'),
+                    udata.get('created_at', time.time()), udata.get('notification_preference', 'following'),
                     json.dumps(udata.get('push_subscription')) if udata.get('push_subscription') else None
                 ))
 
-            # Migrate Follower network graph
             for username, udata in legacy_users.items():
                 following_list = udata.get('following', [])
                 for target in following_list:
                     cursor.execute('INSERT OR IGNORE INTO follows (follower, following) VALUES (?, ?)', (username, target))
-            
             conn.commit()
             print("[*] User accounts and social graph migrated successfully.")
 
-            # Migrate Posts
             posts_migrated = 0
             if os.path.exists(LEGACY_POSTS_DIR):
                 for filepath in glob.glob(os.path.join(LEGACY_POSTS_DIR, '*.json')):
                     try:
                         filename = os.path.basename(filepath)
                         name_without_ext = os.path.splitext(filename)[0]
-                        if not is_safe_post_id(name_without_ext):
-                            continue
-
+                        if not is_safe_post_id(name_without_ext): continue
                         with open(filepath, 'r') as pf:
                             post = json.load(pf)
-
                         cursor.execute('SELECT 1 FROM posts WHERE id = ?', (post.get('id'),))
-                        if cursor.fetchone():
-                            continue
-
+                        if cursor.fetchone(): continue
                         cursor.execute('''
                             INSERT INTO posts (id, author, content, image, timestamp, likes)
                             VALUES (?, ?, ?, ?, ?, ?)
-                        ''', (
-                            post.get('id'),
-                            post.get('author'),
-                            post.get('content', ''),
-                            post.get('image'),
-                            post.get('timestamp', time.time()),
-                            post.get('likes', 0)
-                        ))
+                        ''', (post.get('id'), post.get('author'), post.get('content', ''), post.get('image'), post.get('timestamp', time.time()), post.get('likes', 0)))
                         posts_migrated += 1
                     except Exception as post_err:
-                        print(f"[!] Warning migrating post file {filepath}: {post_err}")
-                
+                        pass
                 conn.commit()
-                if posts_migrated > 0:
-                    print(f"[*] Migrated {posts_migrated} posts successfully.")
+                if posts_migrated > 0: print(f"[*] Migrated {posts_migrated} posts successfully.")
 
-        # Safely archive the old JSON files to avoid repetitive scanning
         os.rename(LEGACY_USERS_FILE, f"{LEGACY_USERS_FILE}.bak")
-        if os.path.exists(LEGACY_POSTS_DIR):
-            os.rename(LEGACY_POSTS_DIR, f"{LEGACY_POSTS_DIR}_bak")
+        if os.path.exists(LEGACY_POSTS_DIR): os.rename(LEGACY_POSTS_DIR, f"{LEGACY_POSTS_DIR}_bak")
         print("[*] Legacy migration complete. JSON files archived safely as .bak")
-
     except Exception as migration_error:
         print(f"[!] Migration failed: {migration_error}")
 
 
-# --- Security Helpers ---
 def hash_password(password, salt=None, user_id=""):
-    """Hashes a password using PBKDF2 HMAC and SHA-256 with the unique user_id injected."""
-    if salt is None:
-        salt = secrets.token_hex(16)
-    
+    if salt is None: salt = secrets.token_hex(16)
     combined_payload = f"{password}{user_id}".encode('utf-8')
-    
-    key = hashlib.pbkdf2_hmac(
-        'sha256', 
-        combined_payload, 
-        salt.encode('utf-8'), 
-        100000
-    )
+    key = hashlib.pbkdf2_hmac('sha256', combined_payload, salt.encode('utf-8'), 100000)
     return salt, key.hex()
 
 def verify_password(stored_salt, stored_hash, provided_password, user_id=""):
-    """Verifies a provided password against the stored salt, hash, and user_id payload."""
     _, provided_hash = hash_password(provided_password, stored_salt, user_id)
     return secrets.compare_digest(stored_hash, provided_hash)
 
 
-# --- Push Notification Engine ---
 def dispatch_single_push(target_username, subscription, title, body, target_url="/"):
-    """Delivers a cryptographic standard push event to a target user's browser."""
-    if not PYWEBPUSH_AVAILABLE:
-        print(f"[Push Warning] Cannot notify {target_username}. Run 'pip install pywebpush' on the server.")
-        return
-
+    if not PYWEBPUSH_AVAILABLE: return
     try:
         webpush(
             subscription_info=subscription,
@@ -230,21 +193,15 @@ def dispatch_single_push(target_username, subscription, title, body, target_url=
         )
         print(f"[Push System] Notification sent to {target_username}")
     except WebPushException as ex:
-        print(f"[Push Error] WebPush failed for {target_username}: {ex}")
-        # Automatically clean up expired or invalid subscriptions
         if ex.response and ex.response.status_code in [404, 410]:
             try:
                 with sqlite3.connect(DB_FILE) as conn:
                     cursor = conn.cursor()
                     cursor.execute('UPDATE users SET push_subscription = NULL WHERE username = ?', (target_username,))
                     conn.commit()
-                print(f"[Push System] Cleared expired subscription for {target_username}")
-            except Exception as clean_err:
-                print(f"[Push Error] Failed to clear subscription: {clean_err}")
+            except: pass
 
-def process_and_send_notifications(author, content, post_id):
-    """Parses mentions and social graph connections to dispatch push notifications in the background."""
-    # Find explicit mentions: @Username#userid
+def process_and_send_notifications(author, content, post_id, is_comment=False, post_owner=None):
     mentions = MENTION_REGEX.findall(content)
     notified_users = set()
 
@@ -253,11 +210,7 @@ def process_and_send_notifications(author, content, post_id):
         
         # 1. Handle Mentions
         for m_username, m_userid in mentions:
-            cursor.execute('''
-                SELECT username, notification_preference, push_subscription 
-                FROM users 
-                WHERE LOWER(username) = LOWER(?) AND user_id = ?
-            ''', (m_username, m_userid))
+            cursor.execute('SELECT username, notification_preference, push_subscription FROM users WHERE LOWER(username) = LOWER(?) AND user_id = ?', (m_username, m_userid))
             row = cursor.fetchone()
             if row:
                 resolved_name, pref, sub_json = row
@@ -265,50 +218,42 @@ def process_and_send_notifications(author, content, post_id):
                     try:
                         subscription = json.loads(sub_json)
                         notified_users.add(resolved_name)
-                        dispatch_single_push(
-                            target_username=resolved_name,
-                            subscription=subscription,
-                            title="You were mentioned!",
-                            body=f"@{author} tagged you: \"{content[:60]}\"",
-                            target_url=f"/#post-{post_id}"
-                        )
-                    except Exception as parse_err:
-                        print(f"[Push Error] Failed to parse subscription payload for {resolved_name}: {parse_err}")
+                        title = "You were mentioned in a comment!" if is_comment else "You were mentioned!"
+                        dispatch_single_push(resolved_name, subscription, title, f"@{author} tagged you: \"{content[:60]}\"", f"/#post-{post_id}")
+                    except: pass
 
-        # 2. Handle Followers & System Notifications
-        cursor.execute('SELECT username, notification_preference, push_subscription FROM users')
-        all_users = cursor.fetchall()
-        
-        for username, pref, sub_json in all_users:
-            if username == author or username in notified_users or pref == 'off' or not sub_json:
-                continue
-                
-            should_notify = False
-            if pref == 'everyone':
-                should_notify = True
-            elif pref == 'following':
-                # Check if this user is a follower of the author
-                cursor.execute('SELECT 1 FROM follows WHERE follower = ? AND following = ?', (username, author))
-                if cursor.fetchone():
-                    should_notify = True
-                    
-            if should_notify:
-                try:
-                    subscription = json.loads(sub_json)
-                    dispatch_single_push(
-                        target_username=username,
-                        subscription=subscription,
-                        title=f"New post from {author}",
-                        body=content[:80] if content else "Shared an image.",
-                        target_url=f"/#post-{post_id}"
-                    )
-                except Exception as parse_err:
-                    print(f"[Push Error] Failed to parse subscription payload for {username}: {parse_err}")
+        # 2. Handle Comment Notification to Post Owner
+        if is_comment and post_owner and post_owner != author and post_owner not in notified_users:
+            cursor.execute('SELECT notification_preference, push_subscription FROM users WHERE username = ?', (post_owner,))
+            row = cursor.fetchone()
+            if row:
+                pref, sub_json = row
+                if pref != 'off' and sub_json:
+                    try:
+                        subscription = json.loads(sub_json)
+                        notified_users.add(post_owner)
+                        dispatch_single_push(post_owner, subscription, f"New comment on your post", f"@{author} commented: \"{content[:60]}\"", f"/#post-{post_id}")
+                    except: pass
+
+        # 3. Handle Followers for New Posts
+        if not is_comment:
+            cursor.execute('SELECT username, notification_preference, push_subscription FROM users')
+            all_users = cursor.fetchall()
+            for username, pref, sub_json in all_users:
+                if username == author or username in notified_users or pref == 'off' or not sub_json: continue
+                should_notify = False
+                if pref == 'everyone': should_notify = True
+                elif pref == 'following':
+                    cursor.execute('SELECT 1 FROM follows WHERE follower = ? AND following = ?', (username, author))
+                    if cursor.fetchone(): should_notify = True
+                if should_notify:
+                    try:
+                        subscription = json.loads(sub_json)
+                        dispatch_single_push(username, subscription, f"New post from {author}", content[:80] if content else "Shared an image.", f"/#post-{post_id}")
+                    except: pass
 
 
-# --- Request Handler ---
 class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
-
     def send_json_response(self, status_code, payload):
         self.send_response(status_code)
         self.send_header('Content-Type', 'application/json')
@@ -327,466 +272,256 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def get_authenticated_user(self):
         auth_header = self.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return None
-        
+        if not auth_header or not auth_header.startswith('Bearer '): return None
         token = auth_header.split(' ')[1]
         session = ACTIVE_SESSIONS.get(token)
-        
-        if session and session['expires'] > time.time():
-            return session['username']
-        
-        if session:
-            del ACTIVE_SESSIONS[token]
+        if session and session['expires'] > time.time(): return session['username']
+        if session: del ACTIVE_SESSIONS[token]
         return None
 
     def parse_post_data(self):
         content_length = int(self.headers.get('Content-Length', 0))
-        if content_length == 0:
-            return {}
-        post_data = self.rfile.read(content_length)
-        try:
-            return json.loads(post_data.decode('utf-8'))
-        except json.JSONDecodeError:
-            return None
+        if content_length == 0: return {}
+        try: return json.loads(self.rfile.read(content_length).decode('utf-8'))
+        except: return None
 
     def do_POST(self):
         data = self.parse_post_data()
-        if data is None:
-            return self.send_json_response(400, {"error": "Invalid JSON format"})
+        if data is None: return self.send_json_response(400, {"error": "Invalid JSON"})
 
-        # --- 1. SIGNUP ---
         if self.path == '/api/signup':
-            username = data.get('username')
-            password = data.get('password')
-
-            if not username or not password:
-                return self.send_json_response(400, {"error": "Username and password required"})
-
-            # Strict Case-Insensitive Username Check
-            username_lower = username.lower()
-            
+            username, password = data.get('username'), data.get('password')
+            if not username or not password: return self.send_json_response(400, {"error": "Username and password required"})
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
-                cursor.execute('SELECT 1 FROM users WHERE LOWER(username) = ?', (username_lower,))
-                if cursor.fetchone():
-                    return self.send_json_response(409, {"error": "Username already exists"})
-
-                # Generate unique 5-character User ID (aA0-zZ9)
+                cursor.execute('SELECT 1 FROM users WHERE LOWER(username) = ?', (username.lower(),))
+                if cursor.fetchone(): return self.send_json_response(409, {"error": "Username already exists"})
                 alphabet = string.ascii_letters + string.digits
                 user_id = "".join(secrets.choice(alphabet) for _ in range(5))
-
                 salt, hashed_pwd = hash_password(password, user_id=user_id)
-                
-                cursor.execute('''
-                    INSERT INTO users (username, user_id, salt, password_hash, created_at, notification_preference)
-                    VALUES (?, ?, ?, ?, ?, 'following')
-                ''', (username, user_id, salt, hashed_pwd, time.time()))
+                cursor.execute('INSERT INTO users (username, user_id, salt, password_hash, created_at, notification_preference) VALUES (?, ?, ?, ?, ?, ?)', (username, user_id, salt, hashed_pwd, time.time(), 'following'))
                 conn.commit()
-
             return self.send_json_response(201, {"message": "User created successfully"})
 
-        # --- 2. LOGIN ---
         elif self.path == '/api/login':
-            username = data.get('username')
-            password = data.get('password')
-
+            username, password = data.get('username'), data.get('password')
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
                 cursor.execute('SELECT salt, password_hash, user_id FROM users WHERE username = ?', (username,))
                 row = cursor.fetchone()
-
-            if not row:
+            if not row or not verify_password(row[0], row[1], password, row[2]):
                 return self.send_json_response(401, {"error": "Invalid username or password"})
-            
-            salt, stored_hash, user_id = row
-            if not verify_password(salt, stored_hash, password, user_id):
-                return self.send_json_response(401, {"error": "Invalid username or password"})
-
             token = secrets.token_urlsafe(32)
-            ACTIVE_SESSIONS[token] = {
-                "username": username,
-                "expires": time.time() + SESSION_EXPIRY_SECONDS
-            }
+            ACTIVE_SESSIONS[token] = {"username": username, "expires": time.time() + SESSION_EXPIRY_SECONDS}
+            return self.send_json_response(200, {"message": "Login successful", "token": token})
 
-            return self.send_json_response(200, {
-                "message": "Login successful",
-                "token": token
-            })
-
-        # --- 3. LOGOUT ---
         elif self.path == '/api/logout':
             auth_header = self.headers.get('Authorization')
             if auth_header and auth_header.startswith('Bearer '):
                 token = auth_header.split(' ')[1]
-                if token in ACTIVE_SESSIONS:
-                    del ACTIVE_SESSIONS[token]
+                if token in ACTIVE_SESSIONS: del ACTIVE_SESSIONS[token]
             return self.send_json_response(200, {"message": "Logged out successfully"})
 
-        # --- USER PROFILE ---
         elif self.path == '/api/users/profile':
             username = self.get_authenticated_user()
-            if not username:
-                return self.send_json_response(401, {"error": "Unauthorized."})
-            
+            if not username: return self.send_json_response(401, {"error": "Unauthorized."})
             target_user = data.get('username')
-            if not target_user:
-                return self.send_json_response(400, {"error": "Target username required"})
-
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT username, user_id, notification_preference 
-                    FROM users WHERE username = ?
-                ''', (target_user,))
+                cursor.execute('SELECT username, user_id, notification_preference FROM users WHERE username = ?', (target_user,))
                 row = cursor.fetchone()
-                
-                if not row:
-                    return self.send_json_response(404, {"error": "User not found"})
-                
+                if not row: return self.send_json_response(404, {"error": "User not found"})
                 target_username, user_id, notification_pref = row
-                
-                # Fetch statistics through aggregated indexes
                 cursor.execute('SELECT COUNT(*) FROM follows WHERE following = ?', (target_user,))
                 followers_count = cursor.fetchone()[0]
-
                 cursor.execute('SELECT COUNT(*) FROM follows WHERE follower = ?', (target_user,))
                 following_count = cursor.fetchone()[0]
-
                 cursor.execute('SELECT 1 FROM follows WHERE follower = ? AND following = ?', (username, target_user))
                 is_following = bool(cursor.fetchone())
+            return self.send_json_response(200, {"username": target_username, "user_id": user_id, "followers_count": followers_count, "following_count": following_count, "is_following": is_following, "is_self": target_user == username, "notification_preference": notification_pref})
 
-            return self.send_json_response(200, {
-                "username": target_username,
-                "user_id": user_id or 'N/A',
-                "followers_count": followers_count,
-                "following_count": following_count,
-                "is_following": is_following,
-                "is_self": target_user == username,
-                "notification_preference": notification_pref
-            })
-
-        # --- SAVE NOTIFICATION PREFERENCES & SUBSCRIPTION ---
         elif self.path == '/api/users/save_notifications_settings':
             username = self.get_authenticated_user()
-            if not username:
-                return self.send_json_response(401, {"error": "Unauthorized."})
-
-            preference = data.get('preference', 'following')
-            subscription = data.get('subscription')
-
-            if preference not in ['off', 'following', 'everyone']:
-                return self.send_json_response(400, {"error": "Invalid preference option"})
-
+            if not username: return self.send_json_response(401, {"error": "Unauthorized."})
+            preference, subscription = data.get('preference', 'following'), data.get('subscription')
             subscription_json = json.dumps(subscription) if subscription else None
-
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
                 cursor.execute('SELECT 1 FROM users WHERE username = ?', (username,))
-                if not cursor.fetchone():
-                    return self.send_json_response(404, {"error": "User profile not found"})
-
-                if preference == 'off':
-                    cursor.execute('''
-                        UPDATE users 
-                        SET notification_preference = ?, push_subscription = NULL 
-                        WHERE username = ?
-                    ''', (preference, username))
-                else:
-                    cursor.execute('''
-                        UPDATE users 
-                        SET notification_preference = ?, push_subscription = COALESCE(?, push_subscription) 
-                        WHERE username = ?
-                    ''', (preference, subscription_json, username))
+                if not cursor.fetchone(): return self.send_json_response(404, {"error": "User not found"})
+                if preference == 'off': cursor.execute('UPDATE users SET notification_preference = ?, push_subscription = NULL WHERE username = ?', (preference, username))
+                else: cursor.execute('UPDATE users SET notification_preference = ?, push_subscription = COALESCE(?, push_subscription) WHERE username = ?', (preference, subscription_json, username))
                 conn.commit()
+            return self.send_json_response(200, {"message": "Settings updated", "preference": preference})
 
-            return self.send_json_response(200, {
-                "message": "Notification preferences updated successfully",
-                "preference": preference
-            })
-
-        # --- FOLLOW/UNFOLLOW ---
         elif self.path == '/api/users/follow':
             username = self.get_authenticated_user()
-            if not username:
-                return self.send_json_response(401, {"error": "Unauthorized."})
-            
-            target_user = data.get('target_user')
-            action = data.get('action') 
-
-            if not target_user:
-                return self.send_json_response(400, {"error": "Target user is required."})
-            if target_user == username:
-                return self.send_json_response(400, {"error": "You cannot follow yourself."})
-
+            if not username: return self.send_json_response(401, {"error": "Unauthorized."})
+            target_user, action = data.get('target_user'), data.get('action') 
+            if target_user == username: return self.send_json_response(400, {"error": "Cannot follow yourself."})
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
-                
-                # Check validity of both parties
-                cursor.execute('SELECT 1 FROM users WHERE username = ?', (username,))
-                if not cursor.fetchone():
-                    return self.send_json_response(401, {"error": "User session invalid."})
-
-                cursor.execute('SELECT 1 FROM users WHERE username = ?', (target_user,))
-                if not cursor.fetchone():
-                    return self.send_json_response(404, {"error": "User not found"})
-
-                if action == 'follow':
-                    cursor.execute('INSERT OR IGNORE INTO follows (follower, following) VALUES (?, ?)', (username, target_user))
-                elif action == 'unfollow':
-                    cursor.execute('DELETE FROM follows WHERE follower = ? AND following = ?', (username, target_user))
+                if action == 'follow': cursor.execute('INSERT OR IGNORE INTO follows (follower, following) VALUES (?, ?)', (username, target_user))
+                elif action == 'unfollow': cursor.execute('DELETE FROM follows WHERE follower = ? AND following = ?', (username, target_user))
                 conn.commit()
-
             return self.send_json_response(200, {"message": f"Successfully {action}ed {target_user}"})
 
         # --- CREATE POST ---
         elif self.path == '/api/posts/create':
             username = self.get_authenticated_user()
-            if not username:
-                return self.send_json_response(401, {"error": "Unauthorized."})
-
-            content = data.get('content')
-            image_data = data.get('image')
-            
-            if not content and not image_data:
-                return self.send_json_response(400, {"error": "Post content or image required"})
-
-            post_id = str(uuid.uuid4())
-            timestamp = time.time()
-
+            if not username: return self.send_json_response(401, {"error": "Unauthorized."})
+            content, image_data = data.get('content'), data.get('image')
+            if not content and not image_data: return self.send_json_response(400, {"error": "Content required"})
+            post_id, timestamp = str(uuid.uuid4()), time.time()
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO posts (id, author, content, image, timestamp, likes)
-                    VALUES (?, ?, ?, ?, ?, 0)
-                ''', (post_id, username, content or "", image_data, timestamp))
+                cursor.execute('INSERT INTO posts (id, author, content, image, timestamp, likes) VALUES (?, ?, ?, ?, ?, 0)', (post_id, username, content or "", image_data, timestamp))
                 conn.commit()
+            threading.Thread(target=process_and_send_notifications, args=(username, content or "", post_id), daemon=True).start()
+            return self.send_json_response(201, {"message": "Post created", "post": {"id": post_id, "author": username, "content": content or "", "image": image_data, "timestamp": timestamp, "likes": 0, "comment_count": 0}})
 
-            post_data = {
-                "id": post_id,
-                "author": username,
-                "content": content or "",
-                "image": image_data,
-                "timestamp": timestamp,
-                "likes": 0
-            }
+        # --- DELETE POST ---
+        elif self.path == '/api/posts/delete':
+            username = self.get_authenticated_user()
+            if not username: return self.send_json_response(401, {"error": "Unauthorized."})
+            post_id = data.get('post_id')
+            if not post_id or not is_safe_post_id(post_id):
+                return self.send_json_response(400, {"error": "Invalid format"})
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT author FROM posts WHERE id = ?', (post_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return self.send_json_response(404, {"error": "Post not found"})
+                if row[0] != username:
+                    return self.send_json_response(403, {"error": "Forbidden: You are not the author of this post"})
+                cursor.execute('DELETE FROM comments WHERE post_id = ?', (post_id,))
+                cursor.execute('DELETE FROM posts WHERE id = ?', (post_id,))
+                conn.commit()
+            return self.send_json_response(200, {"message": "Post deleted successfully", "post_id": post_id})
 
-            # Dispatch background non-blocking Web Push routines
-            threading.Thread(
-                target=process_and_send_notifications,
-                args=(username, content or "", post_id),
-                daemon=True
-            ).start()
+        # --- COMMENTS API ---
+        elif self.path == '/api/posts/comment':
+            username = self.get_authenticated_user()
+            if not username: return self.send_json_response(401, {"error": "Unauthorized."})
+            post_id, content = data.get('post_id'), data.get('content')
+            if not post_id or not content: return self.send_json_response(400, {"error": "Missing data"})
+            
+            comment_id, timestamp = str(uuid.uuid4()), time.time()
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute('INSERT INTO comments (id, post_id, author, content, timestamp) VALUES (?, ?, ?, ?, ?)', (comment_id, post_id, username, content, timestamp))
+                cursor.execute('SELECT author FROM posts WHERE id = ?', (post_id,))
+                post_owner = cursor.fetchone()
+                conn.commit()
+            
+            # Dispatch push notifications to author and mentions inside the comment
+            if post_owner:
+                threading.Thread(target=process_and_send_notifications, args=(username, content, post_id, True, post_owner[0]), daemon=True).start()
 
-            return self.send_json_response(201, {"message": "Post created", "post": post_data})
+            return self.send_json_response(201, {"comment": {"id": comment_id, "author": username, "content": content, "timestamp": timestamp}})
+
+        elif self.path == '/api/posts/comments':
+            post_id = data.get('post_id')
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT id, author, content, timestamp FROM comments WHERE post_id = ? ORDER BY timestamp ASC', (post_id,))
+                rows = cursor.fetchall()
+            comments = [{"id": r[0], "author": r[1], "content": r[2], "timestamp": r[3]} for r in rows]
+            return self.send_json_response(200, {"comments": comments})
 
         # --- LIST POSTS ---
         elif self.path == '/api/posts/list':
             username = self.get_authenticated_user()
-            if not username:
-                return self.send_json_response(401, {"error": "Unauthorized."})
-
-            limit = data.get('limit', 10)
-            feed_type = data.get('feed_type', 'global') 
+            if not username: return self.send_json_response(401, {"error": "Unauthorized."})
+            limit, feed_type = data.get('limit', 10), data.get('feed_type', 'global') 
             
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
-                
-                # Check if following graph is empty
                 cursor.execute('SELECT COUNT(*) FROM follows WHERE follower = ?', (username,))
-                following_count = cursor.fetchone()[0]
-                is_following_empty = (following_count == 0)
-
+                is_following_empty = (cursor.fetchone()[0] == 0)
                 all_posts = []
 
-                if feed_type == 'following':
-                    if not is_following_empty:
-                        cursor.execute('''
-                            SELECT p.id, p.author, p.content, p.image, p.timestamp, p.likes 
-                            FROM posts p
-                            JOIN follows f ON p.author = f.following
-                            WHERE f.follower = ?
-                            ORDER BY p.timestamp DESC
-                            LIMIT ?
-                        ''', (username, limit))
-                        all_posts = cursor.fetchall()
-                else:
+                if feed_type == 'following' and not is_following_empty:
                     cursor.execute('''
-                        SELECT id, author, content, image, timestamp, likes 
-                        FROM posts 
-                        ORDER BY timestamp DESC
-                        LIMIT ?
-                    ''', (limit,))
+                        SELECT p.id, p.author, p.content, p.image, p.timestamp, p.likes, (SELECT COUNT(*) FROM comments WHERE post_id = p.id)
+                        FROM posts p JOIN follows f ON p.author = f.following
+                        WHERE f.follower = ? ORDER BY p.timestamp DESC LIMIT ?
+                    ''', (username, limit))
+                    all_posts = cursor.fetchall()
+                elif feed_type == 'global':
+                    cursor.execute('SELECT id, author, content, image, timestamp, likes, (SELECT COUNT(*) FROM comments WHERE post_id = posts.id) FROM posts ORDER BY timestamp DESC LIMIT ?', (limit,))
                     all_posts = cursor.fetchall()
 
-            posts_list = []
-            for row in all_posts:
-                posts_list.append({
-                    "id": row[0],
-                    "author": row[1],
-                    "content": row[2],
-                    "image": row[3],
-                    "timestamp": row[4],
-                    "likes": row[5]
-                })
-
             return self.send_json_response(200, {
-                "posts": posts_list,
+                "posts": [{"id": r[0], "author": r[1], "content": r[2], "image": r[3], "timestamp": r[4], "likes": r[5], "comment_count": r[6]} for r in all_posts],
                 "is_following_empty": is_following_empty
             })
 
         # --- USER SPECIFIC POSTS ---
         elif self.path == '/api/posts/user':
             username = self.get_authenticated_user()
-            if not username:
-                return self.send_json_response(401, {"error": "Unauthorized."})
-            
-            target_user = data.get('username')
-            if not target_user:
-                return self.send_json_response(400, {"error": "Target username required"})
-
-            limit = data.get('limit', 50)
+            if not username: return self.send_json_response(401, {"error": "Unauthorized."})
+            target_user, limit = data.get('username'), data.get('limit', 50)
             
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT id, author, content, image, timestamp, likes 
-                    FROM posts 
-                    WHERE author = ?
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                ''', (target_user, limit))
+                cursor.execute('SELECT id, author, content, image, timestamp, likes, (SELECT COUNT(*) FROM comments WHERE post_id = posts.id) FROM posts WHERE author = ? ORDER BY timestamp DESC LIMIT ?', (target_user, limit))
                 rows = cursor.fetchall()
-
-            posts_list = []
-            for row in rows:
-                posts_list.append({
-                    "id": row[0],
-                    "author": row[1],
-                    "content": row[2],
-                    "image": row[3],
-                    "timestamp": row[4],
-                    "likes": row[5]
-                })
-
-            return self.send_json_response(200, {"posts": posts_list})
+            return self.send_json_response(200, {"posts": [{"id": r[0], "author": r[1], "content": r[2], "image": r[3], "timestamp": r[4], "likes": r[5], "comment_count": r[6]} for r in rows]})
 
         # --- LIKE POST ---
         elif self.path == '/api/posts/like':
             username = self.get_authenticated_user()
-            if not username:
-                return self.send_json_response(401, {"error": "Unauthorized."})
-
-            post_id = data.get('post_id')
-            action = data.get('action', 'like')
-            
-            if not post_id or not is_safe_post_id(post_id):
-                return self.send_json_response(400, {"error": "Invalid post ID format"})
-
+            if not username: return self.send_json_response(401, {"error": "Unauthorized."})
+            post_id, action = data.get('post_id'), data.get('action', 'like')
+            if not is_safe_post_id(post_id): return self.send_json_response(400, {"error": "Invalid format"})
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
-                cursor.execute('SELECT 1 FROM posts WHERE id = ?', (post_id,))
-                if not cursor.fetchone():
-                    return self.send_json_response(404, {"error": "Post not found"})
-
-                if action == 'like':
-                    cursor.execute('UPDATE posts SET likes = likes + 1 WHERE id = ?', (post_id,))
-                elif action == 'unlike':
-                    cursor.execute('UPDATE posts SET likes = MAX(0, likes - 1) WHERE id = ?', (post_id,))
+                if action == 'like': cursor.execute('UPDATE posts SET likes = likes + 1 WHERE id = ?', (post_id,))
+                elif action == 'unlike': cursor.execute('UPDATE posts SET likes = MAX(0, likes - 1) WHERE id = ?', (post_id,))
                 conn.commit()
-
                 cursor.execute('SELECT likes FROM posts WHERE id = ?', (post_id,))
-                likes = cursor.fetchone()[0]
-
-            return self.send_json_response(200, {"message": "Like updated", "likes": likes})
+                row = cursor.fetchone()
+            return self.send_json_response(200, {"message": "Like updated", "likes": row[0] if row else 0})
 
         # --- SEARCH ---
         elif self.path == '/api/search':
             username = self.get_authenticated_user()
-            if not username:
-                return self.send_json_response(401, {"error": "Unauthorized."})
-
-            query = data.get('query', '').strip().lower()
-            search_type = data.get('type', 'posts')
-
-            if not query:
-                return self.send_json_response(200, {"results": []})
-
+            if not username: return self.send_json_response(401, {"error": "Unauthorized."})
+            query, search_type = data.get('query', '').strip().lower(), data.get('type', 'posts')
+            if not query: return self.send_json_response(200, {"results": []})
             results = []
 
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
-
                 if search_type == 'users':
-                    # Search matching username or suffix
-                    cursor.execute('''
-                        SELECT username, user_id FROM users 
-                        WHERE LOWER(username) LIKE ? 
-                           OR LOWER(username) = ? 
-                           OR LOWER(user_id) = ?
-                    ''', (f"%{query}%", query, query.replace('#', '')))
-                    rows = cursor.fetchall()
-                    
-                    for row in rows:
+                    cursor.execute('SELECT username, user_id FROM users WHERE LOWER(username) LIKE ? OR LOWER(username) = ? OR LOWER(user_id) = ?', (f"%{query}%", query, query.replace('#', '')))
+                    for row in cursor.fetchall():
                         uname, uid = row
-                        
-                        # Followers stats lookup
                         cursor.execute('SELECT COUNT(*) FROM follows WHERE following = ?', (uname,))
                         followers = cursor.fetchone()[0]
-
                         cursor.execute('SELECT COUNT(*) FROM follows WHERE follower = ?', (uname,))
                         following = cursor.fetchone()[0]
-
-                        results.append({
-                            "username": uname,
-                            "user_id": uid or '00000',
-                            "followers_count": followers,
-                            "following_count": following
-                        })
+                        results.append({"username": uname, "user_id": uid or '00000', "followers_count": followers, "following_count": following})
                 else:
-                    # Content/author matching search
                     cursor.execute('''
-                        SELECT id, author, content, image, timestamp, likes 
-                        FROM posts 
-                        WHERE LOWER(content) LIKE ? OR LOWER(author) LIKE ?
-                        ORDER BY timestamp DESC
+                        SELECT id, author, content, image, timestamp, likes, (SELECT COUNT(*) FROM comments WHERE post_id = posts.id) 
+                        FROM posts WHERE LOWER(content) LIKE ? OR LOWER(author) LIKE ? ORDER BY timestamp DESC
                     ''', (f"%{query}%", f"%{query}%"))
-                    rows = cursor.fetchall()
-                    
-                    for row in rows:
-                        results.append({
-                            "id": row[0],
-                            "author": row[1],
-                            "content": row[2],
-                            "image": row[3],
-                            "timestamp": row[4],
-                            "likes": row[5]
-                        })
-
+                    for r in cursor.fetchall():
+                        results.append({"id": r[0], "author": r[1], "content": r[2], "image": r[3], "timestamp": r[4], "likes": r[5], "comment_count": r[6]})
             return self.send_json_response(200, {"results": results})
-
         else:
             return self.send_json_response(404, {"error": "Endpoint not found"})
 
-
 class ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
-    """Threading TCP Server allows concurrent handling of requests natively in Python."""
     allow_reuse_address = True
 
-
 if __name__ == '__main__':
-    # Initialize SQLite Database & Tables on Startup
     init_db()
-
-    if not PYWEBPUSH_AVAILABLE:
-        print("[!] Warning: pywebpush library is not installed.")
-        print("[!] Run: 'pip install pywebpush' to enable background cryptographic pushes.")
-
+    if not PYWEBPUSH_AVAILABLE: print("[!] Run: 'pip install pywebpush' to enable background cryptographic pushes.")
     with ReusableThreadingTCPServer((HOST, PORT), SoshalRequestHandler) as httpd:
         print(f"[*] Threaded SQLite-backed Soshal API Server running at http://{HOST}:{PORT}")
-        print("[*] Waiting for concurrent connections...")
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\n[*] Server stopped.")
-            httpd.server_close()
+        try: httpd.serve_forever()
+        except KeyboardInterrupt: print("\n[*] Server stopped.")
