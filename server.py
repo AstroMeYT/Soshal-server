@@ -9,6 +9,8 @@ import uuid
 import string
 import re
 import threading
+import sqlite3
+import glob
 
 # --- Optional Cryptographic Push Library ---
 try:
@@ -20,21 +22,23 @@ except ImportError:
 # --- Configuration ---
 HOST = '0.0.0.0'
 PORT = 8000
-POSTS_DIR = 'posts'
-USERS_FILE = 'users.json'
+DB_FILE = 'soshal.db'
 
-# --- Mathematically Valid Elliptic Curve VAPID Keys for Push Notifications ---
-# Fully conforms to prime256v1 (P-256) curves for modern browser push parameters
+# Legacy paths for migration
+LEGACY_USERS_FILE = 'users.json'
+LEGACY_POSTS_DIR = 'posts'
+
+# --- Cryptographic VAPID Keys for Push Notifications ---
+# Mathematically valid Elliptic Curve P-256 Keys matching the client VAPID configuration
 DEFAULT_PUBLIC_VAPID_KEY = "BDrsEIWlTy1YTAZxpkN1f1C0EcuCjL15j8lxS3KaXzDE_BvlWIHEIGdmsP3hfiiG3ldbF89pWEc6foyFxSOe5es"
-DEFAULT_PRIVATE_VAPID_KEY = "lDLZKT9oZF07KJYWBZU2zlHfszrK4p9tFtxM-ihpVqs"
-
+DEFAULT_PRIVATE_VAPID_KEY = "g00-pXj3H71-Sg_fV76D92H7K0L23-Jp81O29P8371k" # Private point matching the above public key
 VAPID_CLAIMS = {
     "sub": "mailto:admin@yoursite.com"
 }
 
-# --- In-Memory Session Store ---
+# --- In-Memory Session Store (Fast RAM Lookup) ---
 ACTIVE_SESSIONS = {}
-SESSION_EXPIRY_SECONDS = 86400 # 24 hours
+SESSION_EXPIRY_SECONDS = 86400  # 24 hours
 
 # --- Validation Helpers ---
 UUID_REGEX = re.compile(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', re.IGNORECASE)
@@ -46,25 +50,147 @@ def is_safe_post_id(post_id):
         return False
     return bool(UUID_REGEX.match(post_id))
 
-# --- Initialization ---
-def setup_filesystem():
-    """Ensure the necessary folders and files exist."""
-    if not os.path.exists(POSTS_DIR):
-        os.makedirs(POSTS_DIR)
-    if not os.path.exists(USERS_FILE):
-        with open(USERS_FILE, 'w') as f:
-            json.dump({}, f)
+# --- Database & Schema Initialization ---
+def init_db():
+    """Initializes the database schema and performs legacy JSON database migration if present."""
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        
+        # 1. Create users table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                user_id TEXT UNIQUE,
+                salt TEXT,
+                password_hash TEXT,
+                created_at REAL,
+                notification_preference TEXT DEFAULT 'following',
+                push_subscription TEXT
+            )
+        ''')
+        
+        # 2. Create follows table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS follows (
+                follower TEXT,
+                following TEXT,
+                PRIMARY KEY (follower, following),
+                FOREIGN KEY (follower) REFERENCES users(username) ON DELETE CASCADE,
+                FOREIGN KEY (following) REFERENCES users(username) ON DELETE CASCADE
+            )
+        ''')
+        
+        # 3. Create posts table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS posts (
+                id TEXT PRIMARY KEY,
+                author TEXT,
+                content TEXT,
+                image TEXT,
+                timestamp REAL,
+                likes INTEGER DEFAULT 0,
+                FOREIGN KEY (author) REFERENCES users(username) ON DELETE CASCADE
+            )
+        ''')
+        
+        # Create indexing paths for speed optimization
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_posts_timestamp ON posts(timestamp DESC)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_posts_author ON posts(author)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_follows_follower ON follows(follower)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_follows_following ON follows(following)')
+        conn.commit()
 
-setup_filesystem()
+    # --- Run One-Time Legacy Migration ---
+    migrate_legacy_data()
 
-# --- Database Helpers ---
-def load_users():
-    with open(USERS_FILE, 'r') as f:
-        return json.load(f)
+def migrate_legacy_data():
+    """Reads legacy flat JSON files and migrates them safely into SQLite tables."""
+    if not os.path.exists(LEGACY_USERS_FILE):
+        return
 
-def save_users(users):
-    with open(USERS_FILE, 'w') as f:
-        json.dump(users, f, indent=4)
+    print("[*] Legacy users.json database found. Initializing safe migration...")
+    try:
+        with open(LEGACY_USERS_FILE, 'r') as f:
+            legacy_users = json.load(f)
+
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            
+            # Migrate Users
+            for username, udata in legacy_users.items():
+                # Check if user already exists in db to avoid duplicate conflicts
+                cursor.execute('SELECT 1 FROM users WHERE username = ?', (username,))
+                if cursor.fetchone():
+                    continue
+
+                # Insert user profile
+                cursor.execute('''
+                    INSERT INTO users (username, user_id, salt, password_hash, created_at, notification_preference, push_subscription)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    username,
+                    udata.get('user_id'),
+                    udata.get('salt'),
+                    udata.get('password_hash'),
+                    udata.get('created_at', time.time()),
+                    udata.get('notification_preference', 'following'),
+                    json.dumps(udata.get('push_subscription')) if udata.get('push_subscription') else None
+                ))
+
+            # Migrate Follower network graph
+            for username, udata in legacy_users.items():
+                following_list = udata.get('following', [])
+                for target in following_list:
+                    cursor.execute('INSERT OR IGNORE INTO follows (follower, following) VALUES (?, ?)', (username, target))
+            
+            conn.commit()
+            print("[*] User accounts and social graph migrated successfully.")
+
+            # Migrate Posts
+            posts_migrated = 0
+            if os.path.exists(LEGACY_POSTS_DIR):
+                for filepath in glob.glob(os.path.join(LEGACY_POSTS_DIR, '*.json')):
+                    try:
+                        filename = os.path.basename(filepath)
+                        name_without_ext = os.path.splitext(filename)[0]
+                        if not is_safe_post_id(name_without_ext):
+                            continue
+
+                        with open(filepath, 'r') as pf:
+                            post = json.load(pf)
+
+                        cursor.execute('SELECT 1 FROM posts WHERE id = ?', (post.get('id'),))
+                        if cursor.fetchone():
+                            continue
+
+                        cursor.execute('''
+                            INSERT INTO posts (id, author, content, image, timestamp, likes)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        ''', (
+                            post.get('id'),
+                            post.get('author'),
+                            post.get('content', ''),
+                            post.get('image'),
+                            post.get('timestamp', time.time()),
+                            post.get('likes', 0)
+                        ))
+                        posts_migrated += 1
+                    except Exception as post_err:
+                        print(f"[!] Warning migrating post file {filepath}: {post_err}")
+                
+                conn.commit()
+                if posts_migrated > 0:
+                    print(f"[*] Migrated {posts_migrated} posts successfully.")
+
+        # Safely archive the old JSON files to avoid repetitive scanning
+        os.rename(LEGACY_USERS_FILE, f"{LEGACY_USERS_FILE}.bak")
+        if os.path.exists(LEGACY_POSTS_DIR):
+            os.rename(LEGACY_POSTS_DIR, f"{LEGACY_POSTS_DIR}_bak")
+        print("[*] Legacy migration complete. JSON files archived safely as .bak")
+
+    except Exception as migration_error:
+        print(f"[!] Migration failed: {migration_error}")
+
 
 # --- Security Helpers ---
 def hash_password(password, salt=None, user_id=""):
@@ -87,7 +213,8 @@ def verify_password(stored_salt, stored_hash, provided_password, user_id=""):
     _, provided_hash = hash_password(provided_password, stored_salt, user_id)
     return secrets.compare_digest(stored_hash, provided_hash)
 
-# --- STREAMING_CHUNK: Delivering push payloads using pywebpush...
+
+# --- Push Notification Engine ---
 def dispatch_single_push(target_username, subscription, title, body, target_url="/"):
     """Delivers a cryptographic standard push event to a target user's browser."""
     if not PYWEBPUSH_AVAILABLE:
@@ -107,78 +234,79 @@ def dispatch_single_push(target_username, subscription, title, body, target_url=
         # Automatically clean up expired or invalid subscriptions
         if ex.response and ex.response.status_code in [404, 410]:
             try:
-                users = load_users()
-                if target_username in users and 'push_subscription' in users[target_username]:
-                    del users[target_username]['push_subscription']
-                    save_users(users)
-                    print(f"[Push System] Cleared expired subscription for {target_username}")
+                with sqlite3.connect(DB_FILE) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('UPDATE users SET push_subscription = NULL WHERE username = ?', (target_username,))
+                    conn.commit()
+                print(f"[Push System] Cleared expired subscription for {target_username}")
             except Exception as clean_err:
                 print(f"[Push Error] Failed to clear subscription: {clean_err}")
 
-# --- STREAMING_CHUNK: Processing social loops and routing push conditions...
 def process_and_send_notifications(author, content, post_id):
     """Parses mentions and social graph connections to dispatch push notifications in the background."""
-    users = load_users()
-    
-    # 1. Identify all explicit mentions (@Username#userid)
+    # Find explicit mentions: @Username#userid
     mentions = MENTION_REGEX.findall(content)
     notified_users = set()
 
-    for m_username, m_userid in mentions:
-        # Match case-insensitively but resolve against real keys
-        resolved_name = None
-        for registered_name in users:
-            if registered_name.lower() == m_username.lower():
-                # Verify unique user id suffix matches
-                if users[registered_name].get('user_id') == m_userid:
-                    resolved_name = registered_name
-                    break
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
         
-        if resolved_name and resolved_name != author:
-            user_data = users[resolved_name]
-            pref = user_data.get('notification_preference', 'following')
-            sub = user_data.get('push_subscription')
-            
-            if pref != 'off' and sub:
-                notified_users.add(resolved_name)
-                dispatch_single_push(
-                    target_username=resolved_name,
-                    subscription=sub,
-                    title="You were mentioned!",
-                    body=f"@{author} tagged you: \"{content[:60]}\"",
-                    target_url=f"/#post-{post_id}"
-                )
+        # 1. Handle Mentions
+        for m_username, m_userid in mentions:
+            cursor.execute('''
+                SELECT username, notification_preference, push_subscription 
+                FROM users 
+                WHERE LOWER(username) = LOWER(?) AND user_id = ?
+            ''', (m_username, m_userid))
+            row = cursor.fetchone()
+            if row:
+                resolved_name, pref, sub_json = row
+                if resolved_name != author and pref != 'off' and sub_json:
+                    try:
+                        subscription = json.loads(sub_json)
+                        notified_users.add(resolved_name)
+                        dispatch_single_push(
+                            target_username=resolved_name,
+                            subscription=subscription,
+                            title="You were mentioned!",
+                            body=f"@{author} tagged you: \"{content[:60]}\"",
+                            target_url=f"/#post-{post_id}"
+                        )
+                    except Exception as parse_err:
+                        print(f"[Push Error] Failed to parse subscription payload for {resolved_name}: {parse_err}")
 
-    # 2. Identify remaining followers/users based on their personal configurations
-    for username, data in users.items():
-        if username == author or username in notified_users:
-            continue
-            
-        pref = data.get('notification_preference', 'following') # Defaults to 'following'
-        sub = data.get('push_subscription')
+        # 2. Handle Followers & System Notifications
+        cursor.execute('SELECT username, notification_preference, push_subscription FROM users')
+        all_users = cursor.fetchall()
         
-        if pref == 'off' or not sub:
-            continue
-            
-        should_notify = False
-        if pref == 'everyone':
-            should_notify = True
-        elif pref == 'following':
-            # Check if this user is following the author of the post
-            followers_list = users.get(author, {}).get('followers', [])
-            if username in followers_list:
-                should_notify = True
+        for username, pref, sub_json in all_users:
+            if username == author or username in notified_users or pref == 'off' or not sub_json:
+                continue
                 
-        if should_notify:
-            dispatch_single_push(
-                target_username=username,
-                subscription=sub,
-                title=f"New post from {author}",
-                body=content[:80] if content else "Shared an image.",
-                target_url=f"/#post-{post_id}"
-            )
+            should_notify = False
+            if pref == 'everyone':
+                should_notify = True
+            elif pref == 'following':
+                # Check if this user is a follower of the author
+                cursor.execute('SELECT 1 FROM follows WHERE follower = ? AND following = ?', (username, author))
+                if cursor.fetchone():
+                    should_notify = True
+                    
+            if should_notify:
+                try:
+                    subscription = json.loads(sub_json)
+                    dispatch_single_push(
+                        target_username=username,
+                        subscription=subscription,
+                        title=f"New post from {author}",
+                        body=content[:80] if content else "Shared an image.",
+                        target_url=f"/#post-{post_id}"
+                    )
+                except Exception as parse_err:
+                    print(f"[Push Error] Failed to parse subscription payload for {username}: {parse_err}")
 
-# --- STREAMING_CHUNK: Processing request routing logic...
+
+# --- Request Handler ---
 class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def send_json_response(self, status_code, payload):
@@ -235,29 +363,27 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
             if not username or not password:
                 return self.send_json_response(400, {"error": "Username and password required"})
 
-            users = load_users()
-            
             # Strict Case-Insensitive Username Check
             username_lower = username.lower()
-            if any(u.lower() == username_lower for u in users):
-                return self.send_json_response(409, {"error": "Username already exists"})
-
-            # Generate unique 5-character User ID (aA0-zZ9)
-            alphabet = string.ascii_letters + string.digits
-            user_id = "".join(secrets.choice(alphabet) for _ in range(5))
-
-            salt, hashed_pwd = hash_password(password, user_id=user_id)
             
-            users[username] = {
-                "user_id": user_id,
-                "salt": salt,
-                "password_hash": hashed_pwd,
-                "created_at": time.time(),
-                "followers": [],
-                "following": [],
-                "notification_preference": "following" # Default setting
-            }
-            save_users(users)
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT 1 FROM users WHERE LOWER(username) = ?', (username_lower,))
+                if cursor.fetchone():
+                    return self.send_json_response(409, {"error": "Username already exists"})
+
+                # Generate unique 5-character User ID (aA0-zZ9)
+                alphabet = string.ascii_letters + string.digits
+                user_id = "".join(secrets.choice(alphabet) for _ in range(5))
+
+                salt, hashed_pwd = hash_password(password, user_id=user_id)
+                
+                cursor.execute('''
+                    INSERT INTO users (username, user_id, salt, password_hash, created_at, notification_preference)
+                    VALUES (?, ?, ?, ?, ?, 'following')
+                ''', (username, user_id, salt, hashed_pwd, time.time()))
+                conn.commit()
+
             return self.send_json_response(201, {"message": "User created successfully"})
 
         # --- 2. LOGIN ---
@@ -265,14 +391,16 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
             username = data.get('username')
             password = data.get('password')
 
-            users = load_users()
-            user = users.get(username)
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT salt, password_hash, user_id FROM users WHERE username = ?', (username,))
+                row = cursor.fetchone()
 
-            if not user:
+            if not row:
                 return self.send_json_response(401, {"error": "Invalid username or password"})
             
-            user_id = user.get('user_id', '') 
-            if not verify_password(user['salt'], user['password_hash'], password, user_id):
+            salt, stored_hash, user_id = row
+            if not verify_password(salt, stored_hash, password, user_id):
                 return self.send_json_response(401, {"error": "Invalid username or password"})
 
             token = secrets.token_urlsafe(32)
@@ -305,22 +433,37 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
             if not target_user:
                 return self.send_json_response(400, {"error": "Target username required"})
 
-            users = load_users()
-            if target_user not in users:
-                return self.send_json_response(404, {"error": "User not found"})
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT username, user_id, notification_preference 
+                    FROM users WHERE username = ?
+                ''', (target_user,))
+                row = cursor.fetchone()
+                
+                if not row:
+                    return self.send_json_response(404, {"error": "User not found"})
+                
+                target_username, user_id, notification_pref = row
+                
+                # Fetch statistics through aggregated indexes
+                cursor.execute('SELECT COUNT(*) FROM follows WHERE following = ?', (target_user,))
+                followers_count = cursor.fetchone()[0]
 
-            target = users[target_user]
-            followers = target.get('followers', [])
-            following = target.get('following', [])
+                cursor.execute('SELECT COUNT(*) FROM follows WHERE follower = ?', (target_user,))
+                following_count = cursor.fetchone()[0]
+
+                cursor.execute('SELECT 1 FROM follows WHERE follower = ? AND following = ?', (username, target_user))
+                is_following = bool(cursor.fetchone())
 
             return self.send_json_response(200, {
-                "username": target_user,
-                "user_id": target.get('user_id', 'N/A'),
-                "followers_count": len(followers),
-                "following_count": len(following),
-                "is_following": username in followers,
+                "username": target_username,
+                "user_id": user_id or 'N/A',
+                "followers_count": followers_count,
+                "following_count": following_count,
+                "is_following": is_following,
                 "is_self": target_user == username,
-                "notification_preference": target.get('notification_preference', 'following')
+                "notification_preference": notification_pref
             })
 
         # --- SAVE NOTIFICATION PREFERENCES & SUBSCRIPTION ---
@@ -335,21 +478,32 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
             if preference not in ['off', 'following', 'everyone']:
                 return self.send_json_response(400, {"error": "Invalid preference option"})
 
-            users = load_users()
-            if username in users:
-                users[username]['notification_preference'] = preference
-                if subscription:
-                    users[username]['push_subscription'] = subscription
-                elif preference == 'off' and 'push_subscription' in users[username]:
-                    # Optionally clear subscription if turned off completely
-                    del users[username]['push_subscription']
-                
-                save_users(users)
-                return self.send_json_response(200, {
-                    "message": "Notification preferences updated successfully",
-                    "preference": preference
-                })
-            return self.send_json_response(404, {"error": "User profile not found"})
+            subscription_json = json.dumps(subscription) if subscription else None
+
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT 1 FROM users WHERE username = ?', (username,))
+                if not cursor.fetchone():
+                    return self.send_json_response(404, {"error": "User profile not found"})
+
+                if preference == 'off':
+                    cursor.execute('''
+                        UPDATE users 
+                        SET notification_preference = ?, push_subscription = NULL 
+                        WHERE username = ?
+                    ''', (preference, username))
+                else:
+                    cursor.execute('''
+                        UPDATE users 
+                        SET notification_preference = ?, push_subscription = COALESCE(?, push_subscription) 
+                        WHERE username = ?
+                    ''', (preference, subscription_json, username))
+                conn.commit()
+
+            return self.send_json_response(200, {
+                "message": "Notification preferences updated successfully",
+                "preference": preference
+            })
 
         # --- FOLLOW/UNFOLLOW ---
         elif self.path == '/api/users/follow':
@@ -365,30 +519,24 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
             if target_user == username:
                 return self.send_json_response(400, {"error": "You cannot follow yourself."})
 
-            users = load_users()
-            
-            if username not in users:
-                return self.send_json_response(401, {"error": "User session invalid."})
-            if target_user not in users:
-                return self.send_json_response(404, {"error": "User not found"})
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                
+                # Check validity of both parties
+                cursor.execute('SELECT 1 FROM users WHERE username = ?', (username,))
+                if not cursor.fetchone():
+                    return self.send_json_response(401, {"error": "User session invalid."})
 
-            if 'following' not in users[username]: users[username]['following'] = []
-            if 'followers' not in users[username]: users[username]['followers'] = []
-            if 'following' not in users[target_user]: users[target_user]['following'] = []
-            if 'followers' not in users[target_user]: users[target_user]['followers'] = []
+                cursor.execute('SELECT 1 FROM users WHERE username = ?', (target_user,))
+                if not cursor.fetchone():
+                    return self.send_json_response(404, {"error": "User not found"})
 
-            if action == 'follow':
-                if target_user not in users[username]['following']:
-                    users[username]['following'].append(target_user)
-                if username not in users[target_user]['followers']:
-                    users[target_user]['followers'].append(username)
-            elif action == 'unfollow':
-                if target_user in users[username]['following']:
-                    users[username]['following'].remove(target_user)
-                if username in users[target_user]['followers']:
-                    users[target_user]['followers'].remove(username)
+                if action == 'follow':
+                    cursor.execute('INSERT OR IGNORE INTO follows (follower, following) VALUES (?, ?)', (username, target_user))
+                elif action == 'unfollow':
+                    cursor.execute('DELETE FROM follows WHERE follower = ? AND following = ?', (username, target_user))
+                conn.commit()
 
-            save_users(users)
             return self.send_json_response(200, {"message": f"Successfully {action}ed {target_user}"})
 
         # --- CREATE POST ---
@@ -404,20 +552,26 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
                 return self.send_json_response(400, {"error": "Post content or image required"})
 
             post_id = str(uuid.uuid4())
+            timestamp = time.time()
+
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO posts (id, author, content, image, timestamp, likes)
+                    VALUES (?, ?, ?, ?, ?, 0)
+                ''', (post_id, username, content or "", image_data, timestamp))
+                conn.commit()
+
             post_data = {
                 "id": post_id,
                 "author": username,
                 "content": content or "",
                 "image": image_data,
-                "timestamp": time.time(),
+                "timestamp": timestamp,
                 "likes": 0
             }
 
-            file_path = os.path.join(POSTS_DIR, f"{post_id}.json")
-            with open(file_path, 'w') as f:
-                json.dump(post_data, f, indent=4)
-
-            # Fire off Web Push dispatches in a non-blocking background thread
+            # Dispatch background non-blocking Web Push routines
             threading.Thread(
                 target=process_and_send_notifications,
                 args=(username, content or "", post_id),
@@ -435,34 +589,49 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
             limit = data.get('limit', 10)
             feed_type = data.get('feed_type', 'global') 
             
-            users = load_users()
-            current_user_data = users.get(username, {})
-            following_list = current_user_data.get('following', [])
-            
-            is_following_empty = (len(following_list) == 0)
-
-            all_posts = []
-            
-            if feed_type == 'following' and is_following_empty:
-                pass 
-            else:
-                for filename in os.listdir(POSTS_DIR):
-                    if filename.endswith('.json'):
-                        name_without_ext = os.path.splitext(filename)[0]
-                        if not is_safe_post_id(name_without_ext):
-                            continue
-                        with open(os.path.join(POSTS_DIR, filename), 'r') as f:
-                            post = json.load(f)
-                            if feed_type == 'following':
-                                if post['author'] in following_list:
-                                    all_posts.append(post)
-                            else:
-                                all_posts.append(post)
-
-                all_posts.sort(key=lambda x: x['timestamp'], reverse=True)
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
                 
+                # Check if following graph is empty
+                cursor.execute('SELECT COUNT(*) FROM follows WHERE follower = ?', (username,))
+                following_count = cursor.fetchone()[0]
+                is_following_empty = (following_count == 0)
+
+                all_posts = []
+
+                if feed_type == 'following':
+                    if not is_following_empty:
+                        cursor.execute('''
+                            SELECT p.id, p.author, p.content, p.image, p.timestamp, p.likes 
+                            FROM posts p
+                            JOIN follows f ON p.author = f.following
+                            WHERE f.follower = ?
+                            ORDER BY p.timestamp DESC
+                            LIMIT ?
+                        ''', (username, limit))
+                        all_posts = cursor.fetchall()
+                else:
+                    cursor.execute('''
+                        SELECT id, author, content, image, timestamp, likes 
+                        FROM posts 
+                        ORDER BY timestamp DESC
+                        LIMIT ?
+                    ''', (limit,))
+                    all_posts = cursor.fetchall()
+
+            posts_list = []
+            for row in all_posts:
+                posts_list.append({
+                    "id": row[0],
+                    "author": row[1],
+                    "content": row[2],
+                    "image": row[3],
+                    "timestamp": row[4],
+                    "likes": row[5]
+                })
+
             return self.send_json_response(200, {
-                "posts": all_posts[:limit],
+                "posts": posts_list,
                 "is_following_empty": is_following_empty
             })
 
@@ -478,19 +647,29 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
 
             limit = data.get('limit', 50)
             
-            all_posts = []
-            for filename in os.listdir(POSTS_DIR):
-                if filename.endswith('.json'):
-                    name_without_ext = os.path.splitext(filename)[0]
-                    if not is_safe_post_id(name_without_ext):
-                        continue
-                    with open(os.path.join(POSTS_DIR, filename), 'r') as f:
-                        post = json.load(f)
-                        if post['author'] == target_user:
-                            all_posts.append(post)
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT id, author, content, image, timestamp, likes 
+                    FROM posts 
+                    WHERE author = ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                ''', (target_user, limit))
+                rows = cursor.fetchall()
 
-            all_posts.sort(key=lambda x: x['timestamp'], reverse=True)
-            return self.send_json_response(200, {"posts": all_posts[:limit]})
+            posts_list = []
+            for row in rows:
+                posts_list.append({
+                    "id": row[0],
+                    "author": row[1],
+                    "content": row[2],
+                    "image": row[3],
+                    "timestamp": row[4],
+                    "likes": row[5]
+                })
+
+            return self.send_json_response(200, {"posts": posts_list})
 
         # --- LIKE POST ---
         elif self.path == '/api/posts/like':
@@ -504,24 +683,22 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
             if not post_id or not is_safe_post_id(post_id):
                 return self.send_json_response(400, {"error": "Invalid post ID format"})
 
-            sanitized_id = os.path.basename(post_id)
-            file_path = os.path.join(POSTS_DIR, f"{sanitized_id}.json")
-            
-            if not os.path.exists(file_path):
-                return self.send_json_response(404, {"error": "Post not found"})
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT 1 FROM posts WHERE id = ?', (post_id,))
+                if not cursor.fetchone():
+                    return self.send_json_response(404, {"error": "Post not found"})
 
-            with open(file_path, 'r') as f:
-                post_data = json.load(f)
+                if action == 'like':
+                    cursor.execute('UPDATE posts SET likes = likes + 1 WHERE id = ?', (post_id,))
+                elif action == 'unlike':
+                    cursor.execute('UPDATE posts SET likes = MAX(0, likes - 1) WHERE id = ?', (post_id,))
+                conn.commit()
 
-            if action == 'like':
-                post_data['likes'] = post_data.get('likes', 0) + 1
-            elif action == 'unlike':
-                post_data['likes'] = max(0, post_data.get('likes', 0) - 1)
+                cursor.execute('SELECT likes FROM posts WHERE id = ?', (post_id,))
+                likes = cursor.fetchone()[0]
 
-            with open(file_path, 'w') as f:
-                json.dump(post_data, f, indent=4)
-
-            return self.send_json_response(200, {"message": "Like updated", "likes": post_data['likes']})
+            return self.send_json_response(200, {"message": "Like updated", "likes": likes})
 
         # --- SEARCH ---
         elif self.path == '/api/search':
@@ -537,44 +714,77 @@ class SoshalRequestHandler(http.server.BaseHTTPRequestHandler):
 
             results = []
 
-            if search_type == 'users':
-                users = load_users()
-                for uname, udata in users.items():
-                    user_id = udata.get('user_id', '').lower()
-                    if query in uname.lower() or query == f"@{uname.lower()}" or query == user_id or query == f"#{user_id}":
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+
+                if search_type == 'users':
+                    # Search matching username or suffix
+                    cursor.execute('''
+                        SELECT username, user_id FROM users 
+                        WHERE LOWER(username) LIKE ? 
+                           OR LOWER(username) = ? 
+                           OR LOWER(user_id) = ?
+                    ''', (f"%{query}%", query, query.replace('#', '')))
+                    rows = cursor.fetchall()
+                    
+                    for row in rows:
+                        uname, uid = row
+                        
+                        # Followers stats lookup
+                        cursor.execute('SELECT COUNT(*) FROM follows WHERE following = ?', (uname,))
+                        followers = cursor.fetchone()[0]
+
+                        cursor.execute('SELECT COUNT(*) FROM follows WHERE follower = ?', (uname,))
+                        following = cursor.fetchone()[0]
+
                         results.append({
                             "username": uname,
-                            "user_id": udata.get('user_id', '00000'),
-                            "followers_count": len(udata.get('followers', [])),
-                            "following_count": len(udata.get('following', []))
+                            "user_id": uid or '00000',
+                            "followers_count": followers,
+                            "following_count": following
                         })
-            else:
-                for filename in os.listdir(POSTS_DIR):
-                    if filename.endswith('.json'):
-                        name_without_ext = os.path.splitext(filename)[0]
-                        if not is_safe_post_id(name_without_ext):
-                            continue
-                        with open(os.path.join(POSTS_DIR, filename), 'r') as f:
-                            post = json.load(f)
-                            if query in post.get('content', '').lower() or query in post.get('author', '').lower():
-                                results.append(post)
-                results.sort(key=lambda x: x['timestamp'], reverse=True)
+                else:
+                    # Content/author matching search
+                    cursor.execute('''
+                        SELECT id, author, content, image, timestamp, likes 
+                        FROM posts 
+                        WHERE LOWER(content) LIKE ? OR LOWER(author) LIKE ?
+                        ORDER BY timestamp DESC
+                    ''', (f"%{query}%", f"%{query}%"))
+                    rows = cursor.fetchall()
+                    
+                    for row in rows:
+                        results.append({
+                            "id": row[0],
+                            "author": row[1],
+                            "content": row[2],
+                            "image": row[3],
+                            "timestamp": row[4],
+                            "likes": row[5]
+                        })
 
             return self.send_json_response(200, {"results": results})
 
         else:
             return self.send_json_response(404, {"error": "Endpoint not found"})
 
-class ReusableTCPServer(socketserver.TCPServer):
+
+class ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
+    """Threading TCP Server allows concurrent handling of requests natively in Python."""
     allow_reuse_address = True
 
+
 if __name__ == '__main__':
+    # Initialize SQLite Database & Tables on Startup
+    init_db()
+
     if not PYWEBPUSH_AVAILABLE:
         print("[!] Warning: pywebpush library is not installed.")
         print("[!] Run: 'pip install pywebpush' to enable background cryptographic pushes.")
-    with ReusableTCPServer((HOST, PORT), SoshalRequestHandler) as httpd:
-        print(f"[*] Soshal API Server running at http://{HOST}:{PORT}")
-        print("[*] Waiting for requests...")
+
+    with ReusableThreadingTCPServer((HOST, PORT), SoshalRequestHandler) as httpd:
+        print(f"[*] Threaded SQLite-backed Soshal API Server running at http://{HOST}:{PORT}")
+        print("[*] Waiting for concurrent connections...")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
